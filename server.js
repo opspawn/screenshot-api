@@ -349,6 +349,88 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // x402 discovery endpoint - machine-readable service catalog for agents
+  if (parsed.pathname === '/x402') {
+    sendJson(res, 200, {
+      protocol: 'x402',
+      version: '2.3',
+      service: {
+        name: 'SnapAPI',
+        description: 'Screenshot & document generation API with x402 micropayments',
+        provider: 'OpSpawn',
+        website: 'https://opspawn.com',
+        github: 'https://github.com/opspawn/screenshot-api',
+      },
+      payment: {
+        network: x402.NETWORK,
+        token: 'USDC',
+        facilitator: 'https://facilitator.payai.network',
+        wallet: x402.WALLET_ADDRESS,
+      },
+      endpoints: [
+        {
+          method: 'GET',
+          path: '/api/capture',
+          description: 'Capture screenshot or PDF from a URL',
+          price: x402.PRICES.capture,
+          input: {
+            url: { type: 'string', required: true, description: 'URL to capture' },
+            format: { type: 'string', required: false, description: 'png, jpeg, or pdf', default: 'png' },
+            width: { type: 'number', required: false, description: 'Viewport width (320-3840)', default: 1280 },
+            height: { type: 'number', required: false, description: 'Viewport height (200-2160)', default: 800 },
+            fullPage: { type: 'boolean', required: false, description: 'Capture full scrollable page' },
+          },
+          output: { type: 'binary', mimeTypes: ['image/png', 'image/jpeg', 'application/pdf'] },
+        },
+        {
+          method: 'POST',
+          path: '/api/md2pdf',
+          description: 'Convert Markdown to PDF document',
+          price: x402.PRICES.md2pdf,
+          input: {
+            markdown: { type: 'string', required: true, description: 'Markdown content' },
+            theme: { type: 'string', required: false, description: 'light or dark', default: 'light' },
+            paperSize: { type: 'string', required: false, description: 'A4, Letter, Legal, Tabloid', default: 'A4' },
+          },
+          output: { type: 'binary', mimeTypes: ['application/pdf'] },
+        },
+        {
+          method: 'POST',
+          path: '/api/md2png',
+          description: 'Convert Markdown to PNG image',
+          price: x402.PRICES.md2png,
+          input: {
+            markdown: { type: 'string', required: true, description: 'Markdown content' },
+            theme: { type: 'string', required: false, description: 'light or dark', default: 'light' },
+            width: { type: 'number', required: false, description: 'Viewport width', default: 800 },
+          },
+          output: { type: 'binary', mimeTypes: ['image/png', 'image/jpeg'] },
+        },
+        {
+          method: 'POST',
+          path: '/api/md2html',
+          description: 'Convert Markdown to styled HTML (free, no payment required)',
+          price: '$0.00',
+          input: {
+            markdown: { type: 'string', required: true, description: 'Markdown content' },
+            theme: { type: 'string', required: false, description: 'light or dark', default: 'light' },
+          },
+          output: { type: 'text', mimeTypes: ['text/html'] },
+        },
+      ],
+      mcp: {
+        description: 'Also available as MCP tools for Claude Code/Desktop',
+        tools: ['capture_screenshot', 'markdown_to_pdf', 'markdown_to_image', 'markdown_to_html', 'api_status'],
+        install: 'npx github:opspawn/screenshot-api/mcp-server.mjs',
+      },
+      bazaar: {
+        description: 'x402 Bazaar discovery extensions included in 402 responses',
+        specification: 'https://github.com/x402/x402/tree/main/extensions/bazaar',
+      },
+    });
+    return;
+  }
+
   // API docs - JSON
   if (parsed.pathname === '/api') {
     sendJson(res, 200, {
