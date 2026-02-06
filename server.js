@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { marked } = require('marked');
+const payments = require('./payments');
 
 const PORT = process.env.PORT || 3001;
 const CHROME_PATH = process.env.CHROME_PATH || '/usr/bin/google-chrome';
@@ -596,10 +597,110 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // --- Payment Endpoints ---
+
+  // Create subscription invoice
+  if (parsed.pathname === '/api/subscribe' && req.method === 'POST') {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const plan = body.plan || 'pro';
+      const email = body.email || null;
+
+      const invoice = payments.createInvoice(plan, email);
+
+      sendJson(res, 201, {
+        invoice_id: invoice.id,
+        plan: invoice.plan,
+        amount: invoice.amount,
+        token: 'USDC',
+        network: 'Polygon',
+        wallet: invoice.wallet,
+        expires_at: invoice.expires_at,
+        instructions: `Send exactly ${invoice.amount} USDC to ${invoice.wallet} on Polygon network. The unique amount helps us identify your payment.`,
+        check_url: `/api/subscribe/${invoice.id}`
+      });
+    } catch (err) {
+      sendError(res, 400, err.message);
+    }
+    return;
+  }
+
+  // Check invoice status
+  if (parsed.pathname.startsWith('/api/subscribe/') && req.method === 'GET') {
+    const invoiceId = parsed.pathname.split('/api/subscribe/')[1];
+    if (!invoiceId) return sendError(res, 400, 'Missing invoice ID');
+
+    try {
+      const invoice = await payments.checkPayment(invoiceId);
+      if (!invoice) return sendError(res, 404, 'Invoice not found');
+
+      const response = {
+        invoice_id: invoice.id,
+        status: invoice.status,
+        plan: invoice.plan,
+        amount: invoice.amount
+      };
+
+      if (invoice.status === 'paid') {
+        response.api_key = invoice.api_key;
+        response.tx_hash = invoice.tx_hash;
+        response.message = 'Payment confirmed! Your API key is ready to use.';
+
+        // Also register the key in apiKeys
+        if (invoice.api_key && !apiKeys[invoice.api_key]) {
+          const planData = payments.PLANS[invoice.plan];
+          apiKeys[invoice.api_key] = {
+            name: invoice.email || invoice.plan,
+            tier: invoice.plan,
+            limit: planData.limit,
+            used: 0,
+            resetMonth: new Date().toISOString().slice(0, 7),
+            created: new Date().toISOString()
+          };
+          fs.writeFileSync(API_KEYS_FILE, JSON.stringify(apiKeys, null, 2));
+        }
+      } else if (invoice.status === 'pending') {
+        response.wallet = invoice.wallet;
+        response.network = 'Polygon';
+        response.message = `Waiting for ${invoice.amount} USDC payment to ${invoice.wallet}`;
+      } else if (invoice.status === 'expired') {
+        response.message = 'Invoice expired. Create a new one at POST /api/subscribe';
+      }
+
+      sendJson(res, 200, response);
+    } catch (err) {
+      sendError(res, 500, err.message);
+    }
+    return;
+  }
+
+  // List plans/pricing
+  if (parsed.pathname === '/api/pricing') {
+    sendJson(res, 200, {
+      plans: Object.entries(payments.PLANS).map(([id, plan]) => ({
+        id,
+        name: plan.name,
+        price: plan.price,
+        currency: 'USDC',
+        network: 'Polygon',
+        limit: plan.limit,
+        period: plan.period,
+        features: id === 'pro'
+          ? ['1,000 captures/month', 'All formats (PNG, JPEG, PDF)', 'Markdown conversion', 'Priority support']
+          : ['10,000 captures/month', 'All formats (PNG, JPEG, PDF)', 'Markdown conversion', 'Priority support', 'Higher rate limits']
+      })),
+      wallet: payments.WALLET_ADDRESS,
+      subscribe_url: 'POST /api/subscribe'
+    });
+    return;
+  }
+
   sendError(res, 404, 'Not found. Visit / for API documentation.');
 });
 
 server.listen(PORT, () => {
   console.log(`Screenshot API running at http://localhost:${PORT}`);
   console.log(`API keys: ${Object.keys(apiKeys).length} configured`);
+  // Start payment polling (check every 30 seconds)
+  payments.startPolling(30000);
 });

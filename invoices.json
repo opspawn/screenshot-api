@@ -1,0 +1,17 @@
+{
+  "79965d9149a43546": {
+    "id": "79965d9149a43546",
+    "plan": "pro",
+    "email": "test@example.com",
+    "amount": 10.41,
+    "amount_raw": 10410000,
+    "status": "pending",
+    "wallet": "0x7483a9F237cf8043704D6b17DA31c12BfFF860DD",
+    "network": "Polygon",
+    "token": "USDC",
+    "created_at": "2026-02-06T07:41:21.954Z",
+    "expires_at": "2026-02-06T08:41:21.954Z",
+    "tx_hash": null,
+    "api_key": null
+  }
+}
