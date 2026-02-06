@@ -6,6 +6,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { marked } = require('marked');
 const payments = require('./payments');
+const x402 = require('./x402');
 
 const PORT = process.env.PORT || 3001;
 const CHROME_PATH = process.env.CHROME_PATH || '/usr/bin/google-chrome';
@@ -63,6 +64,52 @@ function sendJson(res, status, data) {
 
 function sendError(res, status, message) {
   sendJson(res, status, { error: message });
+}
+
+// Authenticate via x402 micropayment or API key
+// Returns { ok: true, keyData, settleFn } or { ok: false } (response already sent)
+async function authenticate(req, res, parsed) {
+  if (x402.hasX402Payment(req)) {
+    const payResult = await x402.processPayment(req);
+    if (!payResult.allowed) {
+      const headers = { 'Access-Control-Allow-Origin': '*', ...payResult.headers };
+      res.writeHead(payResult.status, headers);
+      res.end(payResult.isHtml ? payResult.body : JSON.stringify(payResult.body));
+      return { ok: false };
+    }
+    return { ok: true, keyData: null, settleFn: payResult.settle };
+  }
+
+  const apiKey = req.headers['x-api-key'] || parsed.query.api_key;
+  if (!apiKey) {
+    // No auth - return x402 payment requirements
+    const payResult = await x402.processPayment(req);
+    if (!payResult.allowed && payResult.status === 402) {
+      const headers = { 'Access-Control-Allow-Origin': '*', ...payResult.headers };
+      res.writeHead(402, headers);
+      res.end(payResult.isHtml ? payResult.body : JSON.stringify(payResult.body));
+      return { ok: false };
+    }
+    sendError(res, 401, 'Auth required: X-API-Key header, ?api_key= param, or x402 Payment-Signature header.');
+    return { ok: false };
+  }
+  if (!apiKeys[apiKey]) {
+    sendError(res, 401, 'Invalid API key.');
+    return { ok: false };
+  }
+
+  const keyData = apiKeys[apiKey];
+  resetMonthlyUsage(keyData);
+  if (keyData.used >= keyData.limit) {
+    sendError(res, 429, `Monthly limit reached (${keyData.limit}). Upgrade your plan.`);
+    return { ok: false };
+  }
+  if (!checkRateLimit(apiKey)) {
+    sendError(res, 429, 'Rate limit exceeded. Max 10 requests per minute.');
+    return { ok: false };
+  }
+
+  return { ok: true, keyData, settleFn: null };
 }
 
 // Analytics
@@ -279,7 +326,8 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, X-API-Key',
+      'Access-Control-Allow-Headers': 'Content-Type, X-API-Key, Payment-Signature, X-Payment',
+      'Access-Control-Expose-Headers': 'Payment-Required, Payment-Response',
     });
     res.end();
     return;
@@ -305,13 +353,27 @@ const server = http.createServer(async (req, res) => {
   if (parsed.pathname === '/api') {
     sendJson(res, 200, {
       service: 'SnapAPI - Document Generation Suite',
-      version: '2.0.0',
-      description: 'Screenshots, PDFs, and Markdown conversion API',
-      built_by: 'AI Agent (Claude) - transparent about AI authorship',
+      version: '3.0.0',
+      description: 'Screenshots, PDFs, and Markdown conversion API with x402 micropayments',
+      built_by: 'OpSpawn (AI Agent) - transparent about AI authorship',
+      payment: {
+        x402: {
+          description: 'Pay-per-request via x402 protocol (no signup needed)',
+          network: 'Base (USDC)',
+          prices: x402.PRICES,
+          protocol: 'https://x402.org',
+          how: 'Send Payment-Signature header with signed USDC authorization',
+        },
+        subscription: {
+          description: 'Monthly subscription via USDC on Polygon',
+          endpoint: 'POST /api/subscribe',
+        },
+      },
       endpoints: {
         'GET /api/capture': {
           description: 'Capture a screenshot or PDF from a URL',
-          auth: 'X-API-Key header or ?api_key= query param',
+          auth: 'X-API-Key header, ?api_key= query param, OR x402 Payment-Signature header',
+          x402_price: x402.PRICES.capture,
           params: {
             url: 'Target URL (required)',
             format: 'png (default), jpeg, or pdf',
@@ -326,12 +388,14 @@ const server = http.createServer(async (req, res) => {
         },
         'POST /api/md2pdf': {
           description: 'Convert Markdown to PDF',
-          auth: 'X-API-Key header',
+          auth: 'X-API-Key header OR x402 Payment-Signature header',
+          x402_price: x402.PRICES.md2pdf,
           body: 'JSON: { markdown, theme?, paperSize?, landscape?, fontSize?, margins? }',
         },
         'POST /api/md2png': {
           description: 'Convert Markdown to PNG image',
-          auth: 'X-API-Key header',
+          auth: 'X-API-Key header OR x402 Payment-Signature header',
+          x402_price: x402.PRICES.md2png,
           body: 'JSON: { markdown, theme?, width?, fontSize? }',
         },
         'POST /api/md2html': {
@@ -369,24 +433,10 @@ const server = http.createServer(async (req, res) => {
 
   // Capture endpoint
   if (parsed.pathname === '/api/capture') {
-    // Auth
-    const apiKey = req.headers['x-api-key'] || parsed.query.api_key;
-    if (!apiKey || !apiKeys[apiKey]) {
-      return sendError(res, 401, 'Invalid or missing API key. Include X-API-Key header.');
-    }
-
-    const keyData = apiKeys[apiKey];
-    resetMonthlyUsage(keyData);
-
-    // Check monthly limit
-    if (keyData.used >= keyData.limit) {
-      return sendError(res, 429, `Monthly limit reached (${keyData.limit} captures). Upgrade your plan.`);
-    }
-
-    // Rate limit
-    if (!checkRateLimit(apiKey)) {
-      return sendError(res, 429, 'Rate limit exceeded. Max 10 requests per minute.');
-    }
+    // Auth: x402 micropayment OR API key
+    const auth = await authenticate(req, res, parsed);
+    if (!auth.ok) return;
+    const { keyData, settleFn } = auth;
 
     // Concurrency limit
     if (activeTasks >= MAX_CONCURRENT) {
@@ -436,20 +486,34 @@ const server = http.createServer(async (req, res) => {
         userAgent: parsed.query.userAgent,
       });
 
-      keyData.used++;
-      fs.writeFile(API_KEYS_FILE, JSON.stringify(apiKeys, null, 2), () => {});
+      if (keyData) {
+        keyData.used++;
+        fs.writeFile(API_KEYS_FILE, JSON.stringify(apiKeys, null, 2), () => {});
+      }
 
       const contentType = parsed.query.format === 'pdf'
         ? 'application/pdf'
         : parsed.query.format === 'jpeg' ? 'image/jpeg' : 'image/png';
 
-      res.writeHead(200, {
+      const responseHeaders = {
         'Content-Type': contentType,
         'Content-Length': buffer.length,
-        'X-Captures-Used': keyData.used,
-        'X-Captures-Limit': keyData.limit,
         'Access-Control-Allow-Origin': '*',
-      });
+      };
+      if (keyData) {
+        responseHeaders['X-Captures-Used'] = keyData.used;
+        responseHeaders['X-Captures-Limit'] = keyData.limit;
+      }
+
+      // Settle x402 payment after successful capture
+      if (settleFn) {
+        const settleResult = await settleFn();
+        if (settleResult && settleResult.headers) {
+          Object.assign(responseHeaders, settleResult.headers);
+        }
+      }
+
+      res.writeHead(200, responseHeaders);
       res.end(buffer);
     } catch (err) {
       stats.errors++;
@@ -482,18 +546,10 @@ const server = http.createServer(async (req, res) => {
 
   // Markdown to PDF (auth required - uses Puppeteer)
   if (parsed.pathname === '/api/md2pdf' && req.method === 'POST') {
-    const apiKey = req.headers['x-api-key'] || parsed.query.api_key;
-    if (!apiKey || !apiKeys[apiKey]) {
-      return sendError(res, 401, 'Invalid or missing API key. Include X-API-Key header.');
-    }
-    const keyData = apiKeys[apiKey];
-    resetMonthlyUsage(keyData);
-    if (keyData.used >= keyData.limit) {
-      return sendError(res, 429, `Monthly limit reached (${keyData.limit}). Upgrade your plan.`);
-    }
-    if (!checkRateLimit(apiKey)) {
-      return sendError(res, 429, 'Rate limit exceeded. Max 10 requests per minute.');
-    }
+    const auth = await authenticate(req, res, parsed);
+    if (!auth.ok) return;
+    const { keyData, settleFn } = auth;
+
     if (activeTasks >= MAX_CONCURRENT) {
       return sendError(res, 503, 'Server busy. Try again in a few seconds.');
     }
@@ -518,17 +574,30 @@ const server = http.createServer(async (req, res) => {
           marginRight: body.margins?.right,
         });
 
-        keyData.used++;
-        fs.writeFile(API_KEYS_FILE, JSON.stringify(apiKeys, null, 2), () => {});
+        if (keyData) {
+          keyData.used++;
+          fs.writeFile(API_KEYS_FILE, JSON.stringify(apiKeys, null, 2), () => {});
+        }
 
-        res.writeHead(200, {
+        const responseHeaders = {
           'Content-Type': 'application/pdf',
           'Content-Length': buffer.length,
           'Content-Disposition': 'inline; filename="document.pdf"',
-          'X-Captures-Used': keyData.used,
-          'X-Captures-Limit': keyData.limit,
           'Access-Control-Allow-Origin': '*',
-        });
+        };
+        if (keyData) {
+          responseHeaders['X-Captures-Used'] = keyData.used;
+          responseHeaders['X-Captures-Limit'] = keyData.limit;
+        }
+
+        if (settleFn) {
+          const settleResult = await settleFn();
+          if (settleResult && settleResult.headers) {
+            Object.assign(responseHeaders, settleResult.headers);
+          }
+        }
+
+        res.writeHead(200, responseHeaders);
         res.end(buffer);
       } finally {
         activeTasks--;
@@ -542,18 +611,10 @@ const server = http.createServer(async (req, res) => {
 
   // Markdown to PNG (auth required - uses Puppeteer)
   if (parsed.pathname === '/api/md2png' && req.method === 'POST') {
-    const apiKey = req.headers['x-api-key'] || parsed.query.api_key;
-    if (!apiKey || !apiKeys[apiKey]) {
-      return sendError(res, 401, 'Invalid or missing API key. Include X-API-Key header.');
-    }
-    const keyData = apiKeys[apiKey];
-    resetMonthlyUsage(keyData);
-    if (keyData.used >= keyData.limit) {
-      return sendError(res, 429, `Monthly limit reached (${keyData.limit}). Upgrade your plan.`);
-    }
-    if (!checkRateLimit(apiKey)) {
-      return sendError(res, 429, 'Rate limit exceeded. Max 10 requests per minute.');
-    }
+    const auth = await authenticate(req, res, parsed);
+    if (!auth.ok) return;
+    const { keyData, settleFn } = auth;
+
     if (activeTasks >= MAX_CONCURRENT) {
       return sendError(res, 503, 'Server busy. Try again in a few seconds.');
     }
@@ -574,18 +635,31 @@ const server = http.createServer(async (req, res) => {
           quality: body.quality,
         });
 
-        keyData.used++;
-        fs.writeFile(API_KEYS_FILE, JSON.stringify(apiKeys, null, 2), () => {});
+        if (keyData) {
+          keyData.used++;
+          fs.writeFile(API_KEYS_FILE, JSON.stringify(apiKeys, null, 2), () => {});
+        }
 
         const imgType = body.format === 'jpeg' ? 'jpeg' : 'png';
-        res.writeHead(200, {
+        const responseHeaders = {
           'Content-Type': `image/${imgType}`,
           'Content-Length': buffer.length,
           'Content-Disposition': `inline; filename="document.${imgType}"`,
-          'X-Captures-Used': keyData.used,
-          'X-Captures-Limit': keyData.limit,
           'Access-Control-Allow-Origin': '*',
-        });
+        };
+        if (keyData) {
+          responseHeaders['X-Captures-Used'] = keyData.used;
+          responseHeaders['X-Captures-Limit'] = keyData.limit;
+        }
+
+        if (settleFn) {
+          const settleResult = await settleFn();
+          if (settleResult && settleResult.headers) {
+            Object.assign(responseHeaders, settleResult.headers);
+          }
+        }
+
+        res.writeHead(200, responseHeaders);
         res.end(buffer);
       } finally {
         activeTasks--;
@@ -698,9 +772,16 @@ const server = http.createServer(async (req, res) => {
   sendError(res, 404, 'Not found. Visit / for API documentation.');
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
   console.log(`Screenshot API running at http://localhost:${PORT}`);
   console.log(`API keys: ${Object.keys(apiKeys).length} configured`);
   // Start payment polling (check every 30 seconds)
   payments.startPolling(30000);
+  // Initialize x402 micropayment system
+  try {
+    await x402.initX402();
+  } catch (err) {
+    console.error('[x402] Failed to initialize:', err.message);
+    console.log('[x402] API key auth still works. x402 payments disabled.');
+  }
 });
