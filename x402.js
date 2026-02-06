@@ -3,6 +3,7 @@
 
 const { x402HTTPResourceServer, x402ResourceServer, HTTPFacilitatorClient } = require('@x402/core/server');
 const { ExactEvmScheme } = require('@x402/evm/exact/server');
+const { declareDiscoveryExtension, bazaarResourceServerExtension } = require('@x402/extensions/bazaar');
 
 const WALLET_ADDRESS = '0x7483a9F237cf8043704D6b17DA31c12BfFF860DD';
 
@@ -38,8 +39,8 @@ class NodeHTTPAdapter {
 let httpResourceServer = null;
 let initialized = false;
 
-function createRouteConfig(price, description, mimeType) {
-  return {
+function createRouteConfig(price, description, mimeType, discoveryMeta) {
+  const config = {
     accepts: {
       scheme: 'exact',
       network: NETWORK,
@@ -50,6 +51,12 @@ function createRouteConfig(price, description, mimeType) {
     description,
     mimeType,
   };
+  if (discoveryMeta) {
+    config.extensions = {
+      ...declareDiscoveryExtension(discoveryMeta),
+    };
+  }
+  return config;
 }
 
 async function initX402() {
@@ -59,29 +66,68 @@ async function initX402() {
   const resourceServer = new x402ResourceServer([facilitator]);
 
   resourceServer.register(NETWORK, new ExactEvmScheme());
+  resourceServer.registerExtension(bazaarResourceServerExtension);
 
   const routes = {
     'GET /api/capture': createRouteConfig(
       PRICES.capture,
       'Capture screenshot or PDF from a URL',
-      'image/png'
+      'image/png',
+      {
+        input: { url: 'https://example.com', format: 'png' },
+        inputSchema: {
+          properties: {
+            url: { type: 'string', description: 'URL to capture screenshot of' },
+            format: { type: 'string', description: 'Output format: png, jpeg, or pdf' },
+            width: { type: 'number', description: 'Viewport width in pixels (default 1280)' },
+            height: { type: 'number', description: 'Viewport height in pixels (default 800)' },
+            fullPage: { type: 'boolean', description: 'Capture full scrollable page' },
+          },
+          required: ['url'],
+        },
+        output: { example: 'Binary PNG/JPEG image or PDF document' },
+      }
     ),
     'POST /api/md2pdf': createRouteConfig(
       PRICES.md2pdf,
       'Convert Markdown to PDF',
-      'application/pdf'
+      'application/pdf',
+      {
+        input: { markdown: '# Hello World\n\nSample markdown content' },
+        inputSchema: {
+          properties: {
+            markdown: { type: 'string', description: 'Markdown content to convert to PDF' },
+            theme: { type: 'string', description: 'Theme: light or dark (default light)' },
+            paperSize: { type: 'string', description: 'Paper size: A4, Letter, Legal, Tabloid' },
+          },
+          required: ['markdown'],
+        },
+        output: { example: 'Binary PDF document with styled markdown content' },
+      }
     ),
     'POST /api/md2png': createRouteConfig(
       PRICES.md2png,
       'Convert Markdown to PNG image',
-      'image/png'
+      'image/png',
+      {
+        input: { markdown: '# Hello World\n\nSample markdown content' },
+        inputSchema: {
+          properties: {
+            markdown: { type: 'string', description: 'Markdown content to convert to image' },
+            theme: { type: 'string', description: 'Theme: light or dark (default light)' },
+            width: { type: 'number', description: 'Viewport width in pixels (default 800)' },
+          },
+          required: ['markdown'],
+        },
+        output: { example: 'Binary PNG image of rendered markdown' },
+      }
     ),
   };
 
   httpResourceServer = new x402HTTPResourceServer(resourceServer, routes);
   await httpResourceServer.initialize();
   initialized = true;
-  console.log('[x402] Micropayment system initialized (PayAI facilitator)');
+  console.log('[x402] Micropayment system initialized (PayAI facilitator + Bazaar discovery)');
   console.log(`[x402] Accepting USDC on Base to ${WALLET_ADDRESS}`);
   console.log(`[x402] Prices: capture=${PRICES.capture}, md2pdf=${PRICES.md2pdf}, md2png=${PRICES.md2png}`);
   return httpResourceServer;
